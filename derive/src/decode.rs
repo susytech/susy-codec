@@ -29,7 +29,7 @@ pub fn quote(data: &Data, type_name: &Ident, input: &TokenStream) -> TokenStream
 			Fields::Unit => {
 				quote_spanned! {call_site =>
 					drop(#input);
-					Ok(#type_name)
+					Some(#type_name)
 				}
 			},
 		},
@@ -59,12 +59,12 @@ pub fn quote(data: &Data, type_name: &Ident, input: &TokenStream) -> TokenStream
 				}
 			});
 
-			let err_msg = format!("No such variant in enum {}", type_name);
 			quote! {
 				match #input.read_byte()? {
 					#( #recurse )*
-					x => Err(#err_msg.into()),
+					_ => None,
 				}
+
 			}
 
 		},
@@ -72,7 +72,7 @@ pub fn quote(data: &Data, type_name: &Ident, input: &TokenStream) -> TokenStream
 	}
 }
 
-fn create_decode_expr(field: &Field, name: &String, input: &TokenStream) -> TokenStream {
+fn create_decode_expr(field: &Field, input: &TokenStream) -> TokenStream {
 	let encoded_as = utils::get_encoded_as_type(field);
 	let compact = utils::get_enable_compact(field);
 
@@ -83,39 +83,17 @@ fn create_decode_expr(field: &Field, name: &String, input: &TokenStream) -> Toke
 		).to_compile_error();
 	}
 
-	let err_msg = format!("Error decoding field {}", name);
-
 	if compact {
 		let field_type = &field.ty;
 		quote_spanned! { field.span() =>
-			{
-				let res = <<#field_type as _susy_codec::HasCompact>::Type as _susy_codec::Decode>::decode(#input);
-				match res {
-					Err(_) => return Err(#err_msg.into()),
-					Ok(a) => a.into(),
-				}
-			}
+			 <<#field_type as _susy_codec::HasCompact>::Type as _susy_codec::Decode>::decode(#input)?.into()
 		}
 	} else if let Some(encoded_as) = encoded_as {
 		quote_spanned! { field.span() =>
-			{
-				let res = <#encoded_as as _susy_codec::Decode>::decode(#input);
-				match res {
-					Err(_) => return Err(#err_msg.into()),
-					Ok(a) => a.into(),
-				}
-			}
+			 <#encoded_as as _susy_codec::Decode>::decode(#input)?.into()
 		}
 	} else {
-		quote_spanned! { field.span() =>
-			{
-				let res = _susy_codec::Decode::decode(#input);
-				match res {
-					Err(_) => return Err(#err_msg.into()),
-					Ok(a) => a,
-				}
-			}
-		}
+		quote_spanned! { field.span() => _susy_codec::Decode::decode(#input)? }
 	}
 }
 
@@ -128,40 +106,35 @@ fn create_instance(
 	match *fields {
 		Fields::Named(ref fields) => {
 			let recurse = fields.named.iter().map(|f| {
-				let name_ident = &f.ident;
-				let field = match name_ident {
-					Some(a) => format!("{}.{}", name, a),
-					None => format!("{}", name),
-				};
-				let decode = create_decode_expr(f, &field, input);
+				let name = &f.ident;
+				let field = quote_spanned!(call_site => #name);
+				let decode = create_decode_expr(f, input);
 
 				quote_spanned! { f.span() =>
-					#name_ident: #decode
+					#field: #decode
 				}
 			});
 
 			quote_spanned! {call_site =>
-				Ok(#name {
+				Some(#name {
 					#( #recurse, )*
 				})
 			}
 		},
 		Fields::Unnamed(ref fields) => {
-			let recurse = fields.unnamed.iter().enumerate().map(|(i, f) | {
-				let name = format!("{}.{}", name, i);
-
-				create_decode_expr(f, &name, input)
+			let recurse = fields.unnamed.iter().map(|f| {
+				create_decode_expr(f, input)
 			});
 
 			quote_spanned! {call_site =>
-				Ok(#name (
+				Some(#name (
 					#( #recurse, )*
 				))
 			}
 		},
 		Fields::Unit => {
 			quote_spanned! {call_site =>
-				Ok(#name)
+				Some(#name)
 			}
 		},
 	}

@@ -14,7 +14,6 @@
 
 //! Derives serialization and deserialization codec for complex structs for simple marshalling.
 
-#![recursion_limit = "128"]
 extern crate proc_macro;
 use proc_macro2;
 
@@ -71,11 +70,15 @@ pub fn encode_derive(input: TokenStream) -> TokenStream {
 	let name = &input.ident;
 	let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-	let encode_impl = encode::quote(&input.data, name);
+	let self_ = quote!(self);
+	let dest_ = quote!(dest);
+	let encoding = encode::quote(&input.data, name, &self_, &dest_);
 
 	let impl_block = quote! {
 		impl #impl_generics _susy_codec::Encode for #name #ty_generics #where_clause {
-			#encode_impl
+			fn encode_to<EncOut: _susy_codec::Output>(&#self_, #dest_: &mut EncOut) {
+				#encoding
+			}
 		}
 	};
 
@@ -122,7 +125,7 @@ pub fn decode_derive(input: TokenStream) -> TokenStream {
 
 	let impl_block = quote! {
 		impl #impl_generics _susy_codec::Decode for #name #ty_generics #where_clause {
-			fn decode<DecIn: _susy_codec::Input>(#input_: &mut DecIn) -> Result<Self, _susy_codec::Error> {
+			fn decode<DecIn: _susy_codec::Input>(#input_: &mut DecIn) -> Option<Self> {
 				#decoding
 			}
 		}
