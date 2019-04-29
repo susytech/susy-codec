@@ -1,7 +1,7 @@
 [package]
 name = "susy-codec"
 description = "Lightweight, efficient, binary serialization and deserialization codec"
-version = "3.4.0"
+version = "3.5.0"
 authors = ["Susy Technologies <admin@superstring.ch>"]
 license = "Apache-2.0"
 repository = "https://github.com/susytech/susy-codec"
