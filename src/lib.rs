@@ -26,21 +26,43 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate core;
 
-#[cfg(features = "std")]
+#[cfg(feature = "std")]
 extern crate serde;
 
 extern crate arrayvec;
 
+#[cfg(feature = "susy-codec-derive")]
+#[allow(unused_imports)]
+#[macro_use]
+extern crate susy_codec_derive;
+
+#[cfg(all(feature = "std", test))]
+#[macro_use]
+extern crate serde_derive;
+
+#[cfg(feature = "susy-codec-derive")]
+#[doc(hidden)]
+pub use susy_codec_derive::*;
+
 #[cfg(feature = "std")]
 pub mod alloc {
-	pub use std::boxed;
-	pub use std::vec;
+	pub use ::std::boxed;
+	pub use ::std::vec;
+	pub use ::std::string;
+	pub use ::std::borrow;
+
+	#[cfg(feature = "full")]
+	mod full {
+		pub use ::std::borrow;
+	}
+	#[cfg(feature = "full")]
+	pub use self::full::*;
 }
 
 mod codec;
 mod joiner;
 mod keyedvec;
 
-pub use self::codec::{Input, Output, Encode, Decode, Codec, Compact, HasCompact};
+pub use self::codec::{Input, Output, Encode, Decode, Codec, Compact, HasCompact, EncodeAsRef, CompactAs};
 pub use self::joiner::Joiner;
 pub use self::keyedvec::KeyedVec;

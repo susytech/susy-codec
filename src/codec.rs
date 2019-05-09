@@ -16,8 +16,16 @@
 
 use alloc::vec::Vec;
 use alloc::boxed::Box;
+
+#[cfg(any(feature = "std", feature = "full"))]
+use alloc::{
+	string::String,
+	borrow::{Cow, ToOwned},
+};
+
 use core::{mem, slice};
 use arrayvec::ArrayVec;
+use core::marker::PhantomData;
 
 /// Trait that allows reading of data into a slice.
 pub trait Input {
@@ -132,6 +140,7 @@ pub trait Decode: Sized {
 pub trait Codec: Decode + Encode {}
 
 /// Compact-encoded variant of T. This is more space-efficient but less compute-efficient.
+#[derive(Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub struct Compact<T>(pub T);
 
 impl<T> From<T> for Compact<T> {
@@ -140,6 +149,44 @@ impl<T> From<T> for Compact<T> {
 
 impl<'a, T: Copy> From<&'a T> for Compact<T> {
 	fn from(x: &'a T) -> Compact<T> { Compact(*x) }
+}
+
+/// Allow foreign structs to be wrap in Compact
+pub trait CompactAs: From<Compact<Self>> {
+	type As;
+	fn encode_as(&self) -> &Self::As;
+	fn decode_from(Self::As) -> Self;
+}
+
+impl<T> Encode for Compact<T>
+where
+	T: CompactAs,
+	for<'a> CompactRef<'a, <T as CompactAs>::As>: Encode,
+{
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		CompactRef(self.0.encode_as()).encode_to(dest)
+	}
+}
+
+impl<'a, T> Encode for CompactRef<'a, T>
+where
+	T: CompactAs,
+	for<'b> CompactRef<'b, <T as CompactAs>::As>: Encode,
+{
+	fn encode_to<Out: Output>(&self, dest: &mut Out) {
+		CompactRef(self.0.encode_as()).encode_to(dest)
+	}
+}
+
+impl<T> Decode for Compact<T>
+where
+	T: CompactAs,
+	Compact<<T as CompactAs>::As>: Decode,
+{
+	fn decode<I: Input>(input: &mut I) -> Option<Self> {
+		Compact::<T::As>::decode(input)
+			.map(|x| Compact(<T as CompactAs>::decode_from(x.0)))
+	}
 }
 
 macro_rules! impl_from_compact {
@@ -152,26 +199,66 @@ macro_rules! impl_from_compact {
 	}
 }
 
-#[cfg(features = "std")]
-pub trait MaybeDebugSerde: ::std::fmt::Debug + ::serde::Serialize + for<'a> ::serde::Deserialize<'a> {}
-#[cfg(features = "std")]
-impl<T> MaybeDebugSerde for T where T: ::std::fmt::Debug + ::serde::Serialize + for<'a> ::serde::Deserialize<'a> {}
-
-#[cfg(not(features = "std"))]
-pub trait MaybeDebugSerde {}
-#[cfg(features = "std")]
-impl<T> MaybeDebugSerde for T {}
-
 impl_from_compact! { u8, u16, u32, u64, u128 }
 
-/// Trait that tells you if a given type can be encoded/decoded as `Compact<T>`.
-pub trait HasCompact: Copy {
-	type Type: Encode + Decode + From<Self> + Into<Self> + PartialEq + Eq + MaybeDebugSerde;
+/// Compact-encoded variant of &'a T. This is more space-efficient but less compute-efficient.
+#[derive(Eq, PartialEq, Clone, Copy)]
+pub struct CompactRef<'a, T: 'a>(pub &'a T);
+
+impl<'a, T> From<&'a T> for CompactRef<'a, T> {
+	fn from(x: &'a T) -> Self { CompactRef(x) }
 }
 
-impl<T> HasCompact for T where
-	T: Encode + Decode + Copy + PartialEq + Eq + MaybeDebugSerde,
-	Compact<T>: Encode + Decode + From<T> + Into<Self> + PartialEq + Eq + MaybeDebugSerde
+impl<T> ::core::fmt::Debug for Compact<T> where T: ::core::fmt::Debug {
+	fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+#[cfg(feature = "std")]
+impl<T> ::serde::Serialize for Compact<T> where T: ::serde::Serialize {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: ::serde::Serializer {
+		T::serialize(&self.0, serializer)
+	}
+}
+
+#[cfg(feature = "std")]
+impl<'de, T> ::serde::Deserialize<'de> for Compact<T> where T: ::serde::Deserialize<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: ::serde::Deserializer<'de> {
+		T::deserialize(deserializer).map(Compact)
+	}
+}
+
+#[cfg(feature = "std")]
+pub trait MaybeDebugSerde: ::core::fmt::Debug + ::serde::Serialize + for<'a> ::serde::Deserialize<'a> {}
+#[cfg(feature = "std")]
+impl<T> MaybeDebugSerde for T where T: ::core::fmt::Debug + ::serde::Serialize + for<'a> ::serde::Deserialize<'a> {}
+
+#[cfg(not(feature = "std"))]
+pub trait MaybeDebugSerde {}
+#[cfg(not(feature = "std"))]
+impl<T> MaybeDebugSerde for T {}
+
+/// Trait that tells you if a given type can be encoded/decoded in a compact way.
+pub trait HasCompact: Sized {
+	/// The compact type; this can be
+	type Type: for<'a> EncodeAsRef<'a, Self> + Encode + Decode + From<Self> + Into<Self> + Clone +
+		PartialEq + Eq + MaybeDebugSerde;
+}
+
+/// Something that can be encoded as a reference.
+pub trait EncodeAsRef<'a, T: 'a> {
+	/// The reference type that is used for encoding.
+	type RefType: Encode + From<&'a T>;
+}
+
+impl<'a, T: 'a> EncodeAsRef<'a, T> for Compact<T> where CompactRef<'a, T>: Encode + From<&'a T> {
+	type RefType = CompactRef<'a, T>;
+}
+
+impl<T: 'static> HasCompact for T where
+	Compact<T>: for<'a> EncodeAsRef<'a, T> + Encode + Decode + From<Self> + Into<Self> + Clone +
+		PartialEq + Eq + MaybeDebugSerde,
 {
 	type Type = Compact<T>;
 }
@@ -185,31 +272,43 @@ impl<T> HasCompact for T where
 
 // Note: we use *LOW BITS* of the LSB in LE encoding to encode the 2 bit key.
 
-impl Encode for Compact<u8> {
+impl<'a> Encode for CompactRef<'a, u8> {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
 		match self.0 {
 			0...0b00111111 => dest.push_byte(self.0 << 2),
-			_ => (((self.0 as u16) << 2) | 0b01).encode_to(dest),
+			_ => (((*self.0 as u16) << 2) | 0b01).encode_to(dest),
+		}
+	}
+}
+
+impl Encode for Compact<u8> {
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		CompactRef(&self.0).encode_to(dest)
+	}
+}
+
+impl<'a> Encode for CompactRef<'a, u16> {
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		match self.0 {
+			0...0b00111111 => dest.push_byte((*self.0 as u8) << 2),
+			0...0b00111111_11111111 => ((*self.0 << 2) | 0b01).encode_to(dest),
+			_ => (((*self.0 as u32) << 2) | 0b10).encode_to(dest),
 		}
 	}
 }
 
 impl Encode for Compact<u16> {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
-		match self.0 {
-			0...0b00111111 => dest.push_byte((self.0 as u8) << 2),
-			0...0b00111111_11111111 => ((self.0 << 2) | 0b01).encode_to(dest),
-			_ => (((self.0 as u32) << 2) | 0b10).encode_to(dest),
-		}
+		CompactRef(&self.0).encode_to(dest)
 	}
 }
 
-impl Encode for Compact<u32> {
+impl<'a> Encode for CompactRef<'a, u32> {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
 		match self.0 {
-			0...0b00111111 => dest.push_byte((self.0 as u8) << 2),
-			0...0b00111111_11111111 => (((self.0 as u16) << 2) | 0b01).encode_to(dest),
-			0...0b00111111_11111111_11111111_11111111 => ((self.0 << 2) | 0b10).encode_to(dest),
+			0...0b00111111 => dest.push_byte((*self.0 as u8) << 2),
+			0...0b00111111_11111111 => (((*self.0 as u16) << 2) | 0b01).encode_to(dest),
+			0...0b00111111_11111111_11111111_11111111 => ((*self.0 << 2) | 0b10).encode_to(dest),
 			_ => {
 				dest.push_byte(0b11);
 				self.0.encode_to(dest);
@@ -218,17 +317,50 @@ impl Encode for Compact<u32> {
 	}
 }
 
-impl Encode for Compact<u64> {
+impl Encode for Compact<u32> {
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		CompactRef(&self.0).encode_to(dest)
+	}
+}
+
+impl<'a> Encode for CompactRef<'a, u64> {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
 		match self.0 {
-			0...0b00111111 => dest.push_byte((self.0 as u8) << 2),
-			0...0b00111111_11111111 => (((self.0 as u16) << 2) | 0b01).encode_to(dest),
-			0...0b00111111_11111111_11111111_11111111 => (((self.0 as u32) << 2) | 0b10).encode_to(dest),
+			0...0b00111111 => dest.push_byte((*self.0 as u8) << 2),
+			0...0b00111111_11111111 => (((*self.0 as u16) << 2) | 0b01).encode_to(dest),
+			0...0b00111111_11111111_11111111_11111111 => (((*self.0 as u32) << 2) | 0b10).encode_to(dest),
 			_ => {
 				let bytes_needed = 8 - self.0.leading_zeros() / 8;
 				assert!(bytes_needed >= 4, "Previous match arm matches anyting less than 2^30; qed");
 				dest.push_byte(0b11 + ((bytes_needed - 4) << 2) as u8);
-				let mut v = self.0;
+				let mut v = *self.0;
+				for _ in 0..bytes_needed {
+					dest.push_byte(v as u8);
+					v >>= 8;
+				}
+				assert_eq!(v, 0, "shifted sufficient bits right to lead only leading zeros; qed")
+			}
+		}
+	}
+}
+
+impl Encode for Compact<u64> {
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		CompactRef(&self.0).encode_to(dest)
+	}
+}
+
+impl<'a> Encode for CompactRef<'a, u128> {
+	fn encode_to<W: Output>(&self, dest: &mut W) {
+		match self.0 {
+			0...0b00111111 => dest.push_byte((*self.0 as u8) << 2),
+			0...0b00111111_11111111 => (((*self.0 as u16) << 2) | 0b01).encode_to(dest),
+			0...0b00111111_11111111_11111111_11111111 => (((*self.0 as u32) << 2) | 0b10).encode_to(dest),
+			_ => {
+				let bytes_needed = 16 - self.0.leading_zeros() / 8;
+				assert!(bytes_needed >= 4, "Previous match arm matches anyting less than 2^30; qed");
+				dest.push_byte(0b11 + ((bytes_needed - 4) << 2) as u8);
+				let mut v = *self.0;
 				for _ in 0..bytes_needed {
 					dest.push_byte(v as u8);
 					v >>= 8;
@@ -241,22 +373,7 @@ impl Encode for Compact<u64> {
 
 impl Encode for Compact<u128> {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
-		match self.0 {
-			0...0b00111111 => dest.push_byte((self.0 as u8) << 2),
-			0...0b00111111_11111111 => (((self.0 as u16) << 2) | 0b01).encode_to(dest),
-			0...0b00111111_11111111_11111111_11111111 => (((self.0 as u32) << 2) | 0b10).encode_to(dest),
-			_ => {
-				let bytes_needed = 16 - self.0.leading_zeros() / 8;
-				assert!(bytes_needed >= 4, "Previous match arm matches anyting less than 2^30; qed");
-				dest.push_byte(0b11 + ((bytes_needed - 4) << 2) as u8);
-				let mut v = self.0;
-				for _ in 0..bytes_needed {
-					dest.push_byte(v as u8);
-					v >>= 8;
-				}
-				assert_eq!(v, 0, "shifted sufficient bits right to lead only leading zeros; qed")
-			}
-		}
+		CompactRef(&self.0).encode_to(dest)
 	}
 }
 
@@ -392,7 +509,14 @@ impl<T: Decode, E: Decode> Decode for Result<T, E> {
 }
 
 /// Shim type because we can't do a specialised implementation for `Option<bool>` directly.
+#[derive(Eq, PartialEq, Clone, Copy)]
 pub struct OptionBool(pub Option<bool>);
+
+impl ::core::fmt::Debug for OptionBool {
+	fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+		self.0.fmt(f)
+	}
+}
 
 impl Encode for OptionBool {
 	fn using_encoded<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
@@ -509,49 +633,49 @@ impl<'a> Encode for &'a str {
 	}
 }
 
-#[cfg(feature = "std")]
-impl<'a, T: ToOwned + ?Sized + 'a> Encode for ::std::borrow::Cow<'a, T> where
+#[cfg(any(feature = "std", feature = "full"))]
+impl<'a, T: ToOwned + ?Sized + 'a> Encode for Cow<'a, T> where
 	&'a T: Encode,
 	<T as ToOwned>::Owned: Encode
 {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
 		match self {
-			::std::borrow::Cow::Owned(ref x) => x.encode_to(dest),
-			::std::borrow::Cow::Borrowed(x) => x.encode_to(dest),
+			Cow::Owned(ref x) => x.encode_to(dest),
+			Cow::Borrowed(x) => x.encode_to(dest),
 		}
 	}
 }
 
-#[cfg(feature = "std")]
-impl<'a, T: ToOwned + ?Sized> Decode for ::std::borrow::Cow<'a, T> where
+#[cfg(any(feature = "std", feature = "full"))]
+impl<'a, T: ToOwned + ?Sized> Decode for Cow<'a, T> where
 	<T as ToOwned>::Owned: Decode
 {
 	fn decode<I: Input>(input: &mut I) -> Option<Self> {
-		Some(::std::borrow::Cow::Owned(Decode::decode(input)?))
+		Some(Cow::Owned(Decode::decode(input)?))
 	}
 }
 
-#[cfg(feature = "std")]
-impl<T> Encode for ::std::marker::PhantomData<T> {
+#[cfg(any(feature = "std", feature = "full"))]
+impl<T> Encode for PhantomData<T> {
 	fn encode_to<W: Output>(&self, _dest: &mut W) {
 	}
 }
 
-#[cfg(feature = "std")]
-impl<T> Decode for ::std::marker::PhantomData<T> {
+#[cfg(any(feature = "std", feature = "full"))]
+impl<T> Decode for PhantomData<T> {
 	fn decode<I: Input>(_input: &mut I) -> Option<Self> {
-		Some(::std::marker::PhantomData)
+		Some(PhantomData)
 	}
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "full"))]
 impl Encode for String {
 	fn encode_to<W: Output>(&self, dest: &mut W) {
 		self.as_bytes().encode_to(dest)
 	}
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "full"))]
 impl Decode for String {
 	fn decode<I: Input>(input: &mut I) -> Option<Self> {
 		Some(Self::from_utf8_lossy(&Vec::decode(input)?).into())
@@ -834,10 +958,10 @@ mod tests {
 		let tests = [
 			(0u128, 1usize), (63, 1), (64, 2), (16383, 2),
 			(16384, 4), (1073741823, 4),
-			(1073741824, 5), (1 << 32 - 1, 5),
-			(1 << 32, 6), (1 << 40, 7), (1 << 48, 8), (1 << 56 - 1, 8), (1 << 56, 9), (1 << 64 - 1, 9),
-			(1 << 64, 10), (1 << 72, 11), (1 << 80, 12), (1 << 88, 13), (1 << 96, 14), (1 << 104, 15), 
-			(1 << 112, 16), (1 << 120 - 1, 16), (1 << 120, 17), (u128::max_value(), 17)
+			(1073741824, 5), ((1 << 32) - 1, 5),
+			(1 << 32, 6), (1 << 40, 7), (1 << 48, 8), ((1 << 56) - 1, 8), (1 << 56, 9), ((1 << 64) - 1, 9),
+			(1 << 64, 10), (1 << 72, 11), (1 << 80, 12), (1 << 88, 13), (1 << 96, 14), (1 << 104, 15),
+			(1 << 112, 16), ((1 << 120) - 1, 16), (1 << 120, 17), (u128::max_value(), 17)
 		];
 		for &(n, l) in &tests {
 			let encoded = Compact(n as u128).encode();
@@ -851,8 +975,8 @@ mod tests {
 		let tests = [
 			(0u64, 1usize), (63, 1), (64, 2), (16383, 2),
 			(16384, 4), (1073741823, 4),
-			(1073741824, 5), (1 << 32 - 1, 5),
-			(1 << 32, 6), (1 << 40, 7), (1 << 48, 8), (1 << 56 - 1, 8), (1 << 56, 9), (u64::max_value(), 9)
+			(1073741824, 5), ((1 << 32) - 1, 5),
+			(1 << 32, 6), (1 << 40, 7), (1 << 48, 8), ((1 << 56) - 1, 8), (1 << 56, 9), (u64::max_value(), 9)
 		];
 		for &(n, l) in &tests {
 			let encoded = Compact(n as u64).encode();
@@ -891,5 +1015,153 @@ mod tests {
 			assert_eq!(<Compact<u8>>::decode(&mut &encoded[..]).unwrap().0, n);
 		}
 		assert!(<Compact<u8>>::decode(&mut &Compact(256u32).encode()[..]).is_none());
+	}
+
+	fn hexify(bytes: &Vec<u8>) -> String {
+		bytes.iter().map(|ref b| format!("{:02x}", b)).collect::<Vec<String>>().join(" ")
+	}
+
+	#[test]
+	fn string_encoded_as_expected() {
+		let value = String::from("Hello, World!");
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "34 48 65 6c 6c 6f 2c 20 57 6f 72 6c 64 21");
+		assert_eq!(<String>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn vec_of_u8_encoded_as_expected() {
+		let value = vec![0u8, 1, 1, 2, 3, 5, 8, 13, 21, 34];
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "28 00 01 01 02 03 05 08 0d 15 22");
+		assert_eq!(<Vec<u8>>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn vec_of_i16_encoded_as_expected() {
+		let value = vec![0i16, 1, -1, 2, -2, 3, -3];
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "1c 00 00 01 00 ff ff 02 00 fe ff 03 00 fd ff");
+		assert_eq!(<Vec<i16>>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn vec_of_option_int_encoded_as_expected() {
+		let value = vec![Some(1i8), Some(-1), None];
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "0c 01 01 01 ff 00");
+		assert_eq!(<Vec<Option<i8>>>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn vec_of_option_bool_encoded_as_expected() {
+		let value = vec![OptionBool(Some(true)), OptionBool(Some(false)), OptionBool(None)];
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "0c 01 02 00");
+		assert_eq!(<Vec<OptionBool>>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn vec_of_string_encoded_as_expected() {
+		let value = vec![
+			"Hamlet".to_owned(),
+			"Война и мир".to_owned(),
+			"三国演义".to_owned(),
+			"أَلْف لَيْلَة وَلَيْلَة‎".to_owned()
+		];
+		let encoded = value.encode();
+		assert_eq!(hexify(&encoded), "10 18 48 61 6d 6c 65 74 50 d0 92 d0 be d0 b9 d0 bd d0 b0 20 d0 \
+			b8 20 d0 bc d0 b8 d1 80 30 e4 b8 89 e5 9b bd e6 bc 94 e4 b9 89 bc d8 a3 d9 8e d9 84 d9 92 \
+			d9 81 20 d9 84 d9 8e d9 8a d9 92 d9 84 d9 8e d8 a9 20 d9 88 d9 8e d9 84 d9 8e d9 8a d9 92 \
+			d9 84 d9 8e d8 a9 e2 80 8e");
+		assert_eq!(<Vec<String>>::decode(&mut &encoded[..]).unwrap(), value);
+	}
+
+	#[test]
+	fn compact_integers_encoded_as_expected() {
+		let tests = [
+			(0u64, "00"),
+			(63, "fc"),
+			(64, "01 01"),
+			(16383, "fd ff"),
+			(16384, "02 00 01 00"),
+			(1073741823, "fe ff ff ff"),
+			(1073741824, "03 00 00 00 40"),
+			((1 << 32) - 1, "03 ff ff ff ff"),
+			(1 << 32, "07 00 00 00 00 01"),
+			(1 << 40, "0b 00 00 00 00 00 01"),
+			(1 << 48, "0f 00 00 00 00 00 00 01"),
+			((1 << 56) - 1, "0f ff ff ff ff ff ff ff"),
+			(1 << 56, "13 00 00 00 00 00 00 00 01"),
+			(u64::max_value(), "13 ff ff ff ff ff ff ff ff")
+		];
+		for &(n, s) in &tests {
+			// Verify u64 encoding
+			let encoded = Compact(n as u64).encode();
+			assert_eq!(hexify(&encoded), s);
+			assert_eq!(<Compact<u64>>::decode(&mut &encoded[..]).unwrap().0, n);
+
+			// Verify encodings for lower-size uints are compatible with u64 encoding
+			if n <= u32::max_value() as u64 {
+				assert_eq!(<Compact<u32>>::decode(&mut &encoded[..]).unwrap().0, n as u32);
+				let encoded = Compact(n as u32).encode();
+				assert_eq!(hexify(&encoded), s);
+				assert_eq!(<Compact<u64>>::decode(&mut &encoded[..]).unwrap().0, n as u64);
+			}
+			if n <= u16::max_value() as u64 {
+				assert_eq!(<Compact<u16>>::decode(&mut &encoded[..]).unwrap().0, n as u16);
+				let encoded = Compact(n as u16).encode();
+				assert_eq!(hexify(&encoded), s);
+				assert_eq!(<Compact<u64>>::decode(&mut &encoded[..]).unwrap().0, n as u64);
+			}
+			if n <= u8::max_value() as u64 {
+				assert_eq!(<Compact<u8>>::decode(&mut &encoded[..]).unwrap().0, n as u8);
+				let encoded = Compact(n as u8).encode();
+				assert_eq!(hexify(&encoded), s);
+				assert_eq!(<Compact<u64>>::decode(&mut &encoded[..]).unwrap().0, n as u64);
+			}
+		}
+	}
+
+	#[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
+	#[derive(PartialEq, Eq, Clone)]
+	struct Wrapper(u8);
+
+	impl CompactAs for Wrapper {
+		type As = u8;
+		fn encode_as(&self) -> &u8 {
+			&self.0
+		}
+		fn decode_from(x: u8) -> Wrapper {
+			Wrapper(x)
+		}
+	}
+
+	impl From<Compact<Wrapper>> for Wrapper {
+		fn from(x: Compact<Wrapper>) -> Wrapper {
+			x.0
+		}
+	}
+
+	#[test]
+	fn compact_as_8_encoding_works() {
+		let tests = [(0u8, 1usize), (63, 1), (64, 2), (255, 2)];
+		for &(n, l) in &tests {
+			let compact: Compact<Wrapper> = Wrapper(n).into();
+			let encoded = compact.encode();
+			assert_eq!(encoded.len(), l);
+			let decoded = <Compact<Wrapper>>::decode(&mut & encoded[..]).unwrap();
+			let wrapper: Wrapper = decoded.into();
+			assert_eq!(wrapper, Wrapper(n));
+		}
+	}
+
+	struct WithCompact<T: HasCompact> {
+		_data: T,
+	}
+
+	#[test]
+	fn compact_as_has_compact() {
+		let _data = WithCompact { _data: Wrapper(1) };
 	}
 }
