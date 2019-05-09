@@ -1,0 +1,21 @@
+[package]
+name = "susy-codec-derive"
+description = "Serialization and deserialization derive macro for Susy Codec"
+version = "2.1.0"
+authors = ["Susy Technologies <admin@superstring.ch>"]
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "0.14"
+quote = "0.6"
+proc-macro2 = "0.4"
+
+[dev-dependencies]
+susy-codec = { path = "../", version = "~2.1.0" }
+
+[features]
+default = ["std"]
+std = []

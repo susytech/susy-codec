@@ -1,0 +1,21 @@
+[package]
+name = "susy-codec"
+description = "Lightweight, efficient, binary serialization and deserialization codec"
+version = "2.1.0"
+authors = ["Susy Technologies <admin@superstring.ch>"]
+license = "Apache-2.0"
+
+[dependencies]
+arrayvec = { version = "0.4", default-features = false }
+serde = { version = "1.0", optional = true }
+
+[features]
+default = ["std"]
+std = [
+	"serde"
+]
+
+[workspace]
+members = [
+	"derive",
+]
